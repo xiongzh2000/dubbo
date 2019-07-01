@@ -27,11 +27,7 @@ import org.apache.dubbo.rpc.cluster.LoadBalance;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.apache.dubbo.rpc.cluster.Constants.DEFAULT_FORKS;
@@ -54,7 +50,10 @@ public class ForkingClusterInvoker<T> extends AbstractClusterInvoker<T> {
      */
     private final ExecutorService executor = Executors.newCachedThreadPool(
             new NamedInternalThreadFactory("forking-cluster-timer", true));
-
+    // 线程池推荐用 ThreadPoolExecutor 初始化；
+//    Executor executor = new ThreadPoolExecutor(4, 20, 100, TimeUnit.SECONDS,
+//                           new PriorityBlockingQueue<Runnable>(),
+//                           new NamedInternalThreadFactory("forking-cluster-timer", true));
     public ForkingClusterInvoker(Directory<T> directory) {
         super(directory);
     }
@@ -65,8 +64,11 @@ public class ForkingClusterInvoker<T> extends AbstractClusterInvoker<T> {
         try {
             checkInvokers(invokers, invocation);
             final List<Invoker<T>> selected;
+            // 并行数量，默认是 2
             final int forks = getUrl().getParameter(FORKS_KEY, DEFAULT_FORKS);
+            // 调用超时， 默认是 1s
             final int timeout = getUrl().getParameter(TIMEOUT_KEY, DEFAULT_TIMEOUT);
+            // 选出要调用的节点列表；当并行数配置超过调用实例数量，则默认为调用实例数
             if (forks <= 0 || forks >= invokers.size()) {
                 selected = invokers;
             } else {
@@ -79,8 +81,10 @@ public class ForkingClusterInvoker<T> extends AbstractClusterInvoker<T> {
                     }
                 }
             }
+            // 将选中的实例添加到上下文中
             RpcContext.getContext().setInvokers((List) selected);
             final AtomicInteger count = new AtomicInteger();
+            // 使用阻塞队列来存放调用实例的执行结果
             final BlockingQueue<Object> ref = new LinkedBlockingQueue<>();
             for (final Invoker<T> invoker : selected) {
                 executor.execute(new Runnable() {
@@ -91,6 +95,8 @@ public class ForkingClusterInvoker<T> extends AbstractClusterInvoker<T> {
                             ref.offer(result);
                         } catch (Throwable e) {
                             int value = count.incrementAndGet();
+                            // 根据队列先入先出原则，因为该算法是只要有一个调用成功就好，
+                            // 所以只有当全部的调用实例都失败，才记录到队列中，因为下面取结果会判断是不是异常
                             if (value >= selected.size()) {
                                 ref.offer(e);
                             }
@@ -100,6 +106,7 @@ public class ForkingClusterInvoker<T> extends AbstractClusterInvoker<T> {
             }
             try {
                 Object ret = ref.poll(timeout, TimeUnit.MILLISECONDS);
+                // 没有一个实例执行成功，抛出异常
                 if (ret instanceof Throwable) {
                     Throwable e = (Throwable) ret;
                     throw new RpcException(e instanceof RpcException ? ((RpcException) e).getCode() : 0, "Failed to forking invoke provider " + selected + ", but no luck to perform the invocation. Last error is: " + e.getMessage(), e.getCause() != null ? e.getCause() : e);

@@ -63,8 +63,11 @@ public class MergeableClusterInvoker<T> extends AbstractClusterInvoker<T> {
     @Override
     protected Result doInvoke(Invocation invocation, List<Invoker<T>> invokers, LoadBalance loadbalance) throws RpcException {
         checkInvokers(invokers, invocation);
+        // 获取 merger 配置参数值
         String merger = getUrl().getMethodParameter(invocation.getMethodName(), MERGER_KEY);
+        // s1, 没有配置 merger,
         if (ConfigUtils.isEmpty(merger)) { // If a method doesn't have a merger, only invoke one Group
+            // 如果方法不需要Merge，退化为只调一个group即可--选择第一个有效的Invoker调用并返回结果
             for (final Invoker<T> invoker : invokers) {
                 if (invoker.isAvailable()) {
                     try {
@@ -78,9 +81,12 @@ public class MergeableClusterInvoker<T> extends AbstractClusterInvoker<T> {
                     }
                 }
             }
+            //如果没有任意Invoker满足isAvailable(), 那么尝试调用第一个Invoker(多尝试一下, 多一次机会)
             return invokers.iterator().next().invoke(invocation);
         }
 
+
+        //S2, 异步调用不同分组下所有服务；
         Class<?> returnType;
         try {
             returnType = getInterface().getMethod(
@@ -90,9 +96,12 @@ public class MergeableClusterInvoker<T> extends AbstractClusterInvoker<T> {
         }
 
         Map<String, Result> results = new HashMap<>();
+        // 异步调用所有的实例，并把对象存储到 results 中,key为 [{group}/{interfaceName}:{version}]
         for (final Invoker<T> invoker : invokers) {
             RpcInvocation subInvocation = new RpcInvocation(invocation, invoker);
+            //todo xyds ，异步调用的实现的封装
             subInvocation.setAttachment(ASYNC_KEY, "true");
+            //todo 后面一次是异常 是否会覆盖前面一次的正确结果；
             results.put(invoker.getUrl().getServiceKey(), invoker.invoke(subInvocation));
         }
 
@@ -103,8 +112,10 @@ public class MergeableClusterInvoker<T> extends AbstractClusterInvoker<T> {
         for (Map.Entry<String, Result> entry : results.entrySet()) {
             Result asyncResult = entry.getValue();
             try {
+                //即阻塞等待线程执行完成
                 Result r = asyncResult.get();
                 if (r.hasException()) {
+                    //如果异步执行有异常(包括超时), 那么输出error级别的日志, 不影响最终的结果(只是部分数据缺失)
                     log.error("Invoke " + getGroupDescFromServiceKey(entry.getKey()) +
                                     " failed: " + r.getException().getMessage(),
                             r.getException());
@@ -116,16 +127,20 @@ public class MergeableClusterInvoker<T> extends AbstractClusterInvoker<T> {
             }
         }
 
+        // S3 对结果合并；
         if (resultList.isEmpty()) {
             return AsyncRpcResult.newDefaultAsyncResult(invocation);
         } else if (resultList.size() == 1) {
+            //如果只有一个结果, 那么直接返回即可
             return resultList.iterator().next();
         }
 
         if (returnType == void.class) {
+            //如果返回类型为void, 那么new一个result为null的RpcResult返回即可
             return AsyncRpcResult.newDefaultAsyncResult(invocation);
         }
 
+        // S3.1  . 开头，例如merger=".addAll", 这段逻辑就是调用结果类型的原生方法, 例如服务的返回结果是List<Long>，即list类型，那么merger=".addAll"就是调用List集合的.addAll()
         if (merger.startsWith(".")) {
             merger = merger.substring(1);
             Method method;
@@ -140,6 +155,8 @@ public class MergeableClusterInvoker<T> extends AbstractClusterInvoker<T> {
             }
             result = resultList.remove(0).getValue();
             try {
+                //如果merger=".addAll"指定的方法返回类型不为void，且和dubbo服务接口方法返回类型是相同类型
+                //.addAll()返回类型是boolean，而dubbo服务接口方法返回类型是List
                 if (method.getReturnType() != void.class
                         && method.getReturnType().isAssignableFrom(result.getClass())) {
                     for (Result r : resultList) {
@@ -155,9 +172,12 @@ public class MergeableClusterInvoker<T> extends AbstractClusterInvoker<T> {
             }
         } else {
             Merger resultMerger;
+            //true和default都是默认值(大小写不敏感)
             if (ConfigUtils.isDefault(merger)) {
+                //dubbo服务接口方法返回类型中查找merger配置的方法, SPI org/apache/dubbo/rpc/cluster/Merger.java
                 resultMerger = MergerFactory.getMerger(returnType);
             } else {
+                //自定义merger实现
                 resultMerger = ExtensionLoader.getExtensionLoader(Merger.class).getExtension(merger);
             }
             if (resultMerger != null) {
